@@ -1,4 +1,4 @@
-# DynamoDB - Python Data Source for AWS DynamoDB
+# Python Data Source for AWS DynamoDB
 
 Python Data Source for Apache Spark enabling batch and streaming reads/writes to AWS DynamoDB.
 
