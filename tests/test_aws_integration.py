@@ -87,6 +87,42 @@ def aws_composite_table():
     table.wait_until_not_exists()
 
 
+@pytest.fixture(scope="module")
+def aws_ttl_table():
+    """Create a temporary DynamoDB table with TTL enabled."""
+    import boto3
+
+    ttl_table_name = f"{TABLE_NAME}_ttl"
+    dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
+    client = boto3.client("dynamodb", region_name=AWS_REGION)
+
+    table = dynamodb.create_table(
+        TableName=ttl_table_name,
+        KeySchema=[
+            {"AttributeName": "id", "KeyType": "HASH"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "id", "AttributeType": "S"},
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    table.wait_until_exists()
+
+    # Enable TTL on the "expire_at" attribute
+    client.update_time_to_live(
+        TableName=ttl_table_name,
+        TimeToLiveSpecification={
+            "Enabled": True,
+            "AttributeName": "expire_at",
+        },
+    )
+
+    yield table
+
+    table.delete()
+    table.wait_until_not_exists()
+
+
 def _spark_options(table_name):
     """Return the common Spark .option() kwargs for AWS."""
     return {
@@ -204,6 +240,52 @@ def test_batch_write_with_delete_flag(spark, aws_table):
     assert resp["Item"]["name"] == "Alive"
 
 
+def test_batch_write_delete_flag_composite_key(spark, aws_composite_table):
+    """Delete flag should work correctly with hash + range key tables."""
+    _clear_table(aws_composite_table)
+
+    # Pre-insert items via boto3
+    aws_composite_table.put_item(Item={"pk": "u1", "sk": "2025-01", "payload": "old_a"})
+    aws_composite_table.put_item(Item={"pk": "u1", "sk": "2025-02", "payload": "old_b"})
+    aws_composite_table.put_item(Item={"pk": "u2", "sk": "2025-01", "payload": "old_c"})
+    time.sleep(1)
+
+    # Delete one item, upsert another, insert a new one
+    data = [
+        ("u1", "2025-01", "old_a", "yes"),    # delete
+        ("u1", "2025-02", "updated_b", "no"),  # upsert (keep)
+        ("u3", "2025-03", "new_d", "no"),      # insert
+    ]
+    df = spark.createDataFrame(data, ["pk", "sk", "payload", "del_flag"])
+
+    composite_name = f"{TABLE_NAME}_composite"
+    opts = _spark_options(composite_name)
+    writer = df.write.format("dynamodb").mode("append")
+    for k, v in opts.items():
+        writer = writer.option(k, v)
+    writer.option("delete_flag_column", "del_flag") \
+          .option("delete_flag_value", "yes") \
+          .save()
+
+    time.sleep(2)
+
+    # Deleted item should be gone
+    resp = aws_composite_table.get_item(Key={"pk": "u1", "sk": "2025-01"})
+    assert "Item" not in resp
+
+    # Upserted item should have updated payload
+    resp = aws_composite_table.get_item(Key={"pk": "u1", "sk": "2025-02"})
+    assert resp["Item"]["payload"] == "updated_b"
+
+    # New item should exist
+    resp = aws_composite_table.get_item(Key={"pk": "u3", "sk": "2025-03"})
+    assert resp["Item"]["payload"] == "new_d"
+
+    # Untouched item should still exist
+    resp = aws_composite_table.get_item(Key={"pk": "u2", "sk": "2025-01"})
+    assert resp["Item"]["payload"] == "old_c"
+
+
 def test_batch_write_composite_key(spark, aws_composite_table):
     """Write to a table with hash + range key."""
     _clear_table(aws_composite_table)
@@ -227,6 +309,84 @@ def test_batch_write_composite_key(spark, aws_composite_table):
     scan = aws_composite_table.scan()
     items = scan.get("Items", [])
     assert len(items) == 3
+
+
+def test_batch_write_with_ttl(spark, aws_ttl_table):
+    """Write items with a TTL column and verify the epoch value is stored."""
+    _clear_table(aws_ttl_table)
+
+    ttl_table_name = f"{TABLE_NAME}_ttl"
+
+    # expire_at is a Unix epoch timestamp (int seconds)
+    # One item set far in the future, one set in the past
+    future_ts = int(time.time()) + 86400 * 365  # ~1 year from now
+    past_ts = int(time.time()) - 3600            # 1 hour ago
+
+    data = [
+        ("ttl-001", "Permanent", future_ts),
+        ("ttl-002", "Expired", past_ts),
+    ]
+    df = spark.createDataFrame(data, ["id", "name", "expire_at"])
+
+    opts = _spark_options(ttl_table_name)
+    writer = df.write.format("dynamodb").mode("append")
+    for k, v in opts.items():
+        writer = writer.option(k, v)
+    writer.save()
+
+    time.sleep(2)
+
+    # Verify items were written with the TTL attribute
+    resp = aws_ttl_table.get_item(Key={"id": "ttl-001"})
+    assert "Item" in resp
+    assert resp["Item"]["expire_at"] == future_ts
+
+    resp = aws_ttl_table.get_item(Key={"id": "ttl-002"})
+    assert "Item" in resp
+    assert resp["Item"]["expire_at"] == past_ts
+
+    # Verify TTL is enabled on the table
+    import boto3
+
+    client = boto3.client("dynamodb", region_name=AWS_REGION)
+    ttl_desc = client.describe_time_to_live(TableName=ttl_table_name)
+    ttl_status = ttl_desc["TimeToLiveDescription"]["TimeToLiveStatus"]
+    assert ttl_status in ("ENABLED", "ENABLING")
+    assert ttl_desc["TimeToLiveDescription"]["AttributeName"] == "expire_at"
+
+
+def test_batch_write_and_read_with_ttl(spark, aws_ttl_table):
+    """Write items with TTL via Spark, read back, verify the TTL column round-trips."""
+    _clear_table(aws_ttl_table)
+
+    ttl_table_name = f"{TABLE_NAME}_ttl"
+    future_ts = int(time.time()) + 86400 * 30  # 30 days from now
+
+    data = [
+        ("ttlrt-001", "Alice", future_ts),
+        ("ttlrt-002", "Bob", future_ts + 100),
+    ]
+    df_write = spark.createDataFrame(data, ["id", "name", "expire_at"])
+
+    opts = _spark_options(ttl_table_name)
+    writer = df_write.write.format("dynamodb").mode("append")
+    for k, v in opts.items():
+        writer = writer.option(k, v)
+    writer.save()
+
+    time.sleep(2)
+
+    # Read back via Spark
+    reader = spark.read.format("dynamodb")
+    for k, v in opts.items():
+        reader = reader.option(k, v)
+    df_read = reader.load()
+
+    assert "expire_at" in df_read.columns
+    rows = {r["id"]: r for r in df_read.collect()}
+    assert len(rows) == 2
+    assert rows["ttlrt-001"]["expire_at"] == future_ts
+    assert rows["ttlrt-002"]["expire_at"] == future_ts + 100
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +528,37 @@ def test_write_then_read_roundtrip(spark, aws_table):
     assert rows["rt-002"]["name"] == "Bob"
 
 
+def test_write_and_read_at_scale(spark, aws_table):
+    """Write 10k records via Spark, read back, verify count and data integrity."""
+    _clear_table(aws_table)
+
+    # Generate 10,000 rows and repartition for parallel writes
+    data = [(f"scale-{i:05d}", f"User_{i}", i % 100, i * 10) for i in range(10_000)]
+    df_write = spark.createDataFrame(data, ["id", "name", "age", "score"]).repartition(4)
+
+    opts = _spark_options(TABLE_NAME)
+    writer = df_write.write.format("dynamodb").mode("append")
+    for k, v in opts.items():
+        writer = writer.option(k, v)
+    writer.save()
+
+    time.sleep(5)
+
+    # Read back with parallel segments for speed
+    reader = spark.read.format("dynamodb").option("total_segments", "4")
+    for k, v in opts.items():
+        reader = reader.option(k, v)
+    df_read = reader.load()
+
+    assert df_read.count() == 10_000
+
+    # Spot-check a few known records
+    rows = {r["id"]: r for r in df_read.filter(df_read.id.isin("scale-00000", "scale-05000", "scale-09999")).collect()}
+    assert rows["scale-00000"]["name"] == "User_0"
+    assert rows["scale-05000"]["name"] == "User_5000"
+    assert rows["scale-09999"]["name"] == "User_9999"
+
+
 # ---------------------------------------------------------------------------
 # Streaming write test
 # ---------------------------------------------------------------------------
@@ -408,3 +599,52 @@ def test_stream_write_with_rate_source(spark, aws_table):
     scan = aws_table.scan()
     items = [i for i in scan.get("Items", []) if i["id"].startswith("stream-")]
     assert len(items) > 0, "Expected at least one streamed item in DynamoDB"
+
+
+def test_stream_write_with_delete_flag(spark, aws_table):
+    """Stream write with delete_flag_column should delete matching items."""
+    import pyspark.sql.functions as F
+
+    _clear_table(aws_table)
+
+    # Pre-insert items that the stream will delete
+    aws_table.put_item(Item={"id": "sdel-0", "name": "ToDelete0"})
+    aws_table.put_item(Item={"id": "sdel-1", "name": "ToDelete1"})
+    aws_table.put_item(Item={"id": "sdel-2", "name": "ToDelete2"})
+    time.sleep(1)
+
+    # Rate source produces (timestamp, value). We derive an id that matches a
+    # pre-inserted item and set the delete flag to "yes" for every row.
+    stream_df = (
+        spark.readStream
+        .format("rate")
+        .option("rowsPerSecond", 5)
+        .option("numPartitions", 1)
+        .load()
+        .withColumn("id", F.concat(F.lit("sdel-"), (F.col("value") % 3).cast("string")))
+        .withColumn("name", F.lit("streamed"))
+        .withColumn("del_flag", F.lit("yes"))
+        .select("id", "name", "del_flag")
+    )
+
+    opts = _spark_options(TABLE_NAME)
+    query = stream_df.writeStream.format("dynamodb").outputMode("append")
+    for k, v in opts.items():
+        query = query.option(k, v)
+    query = (
+        query
+        .option("delete_flag_column", "del_flag")
+        .option("delete_flag_value", "yes")
+        .option("checkpointLocation", f"/tmp/spark_ddb_del_test_{uuid.uuid4().hex[:8]}")
+    )
+    running = query.start()
+
+    try:
+        time.sleep(10)
+    finally:
+        running.stop()
+
+    # All three pre-inserted items should have been deleted
+    for i in range(3):
+        resp = aws_table.get_item(Key={"id": f"sdel-{i}"})
+        assert "Item" not in resp, f"Expected sdel-{i} to be deleted"

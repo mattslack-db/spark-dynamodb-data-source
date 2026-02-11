@@ -4,3 +4,4 @@ dist/
 /cov.xml
 /pytest-coverage.txt
 /test-unit.xml
+.env
