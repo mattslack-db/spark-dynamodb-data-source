@@ -21,10 +21,15 @@ class DynamoDbWriter:
         self.aws_secret_access_key = options.get("aws_secret_access_key")
         self.aws_session_token = options.get("aws_session_token")
         self.endpoint_url = options.get("endpoint_url")
+        self.credential_name = options.get("credential_name")
 
         # Write options
         self.delete_flag_column = options.get("delete_flag_column")
         self.delete_flag_value = options.get("delete_flag_value")
+        self.create_table = options.get("create_table", "false").lower() == "true"
+        self.hash_key_name = options.get("hash_key")
+        self.range_key_name = options.get("range_key")
+        self.billing_mode = options.get("billing_mode", "PAY_PER_REQUEST")
 
         # Validate delete flag options
         if bool(self.delete_flag_column) != bool(self.delete_flag_value):
@@ -32,7 +37,14 @@ class DynamoDbWriter:
                 "Both delete_flag_column and delete_flag_value must be specified together, or neither"
             )
 
-        # Load table metadata (key schema) and validate DataFrame schema
+        # Validate create_table options
+        if self.create_table and not self.hash_key_name:
+            raise ValueError("hash_key option is required when create_table is true")
+
+        # Resolve credentials, create table if needed, and load table metadata
+        self._resolve_credentials()
+        if self.create_table:
+            self._create_table_if_not_exists()
         self._load_table_metadata()
 
     def _validate_options(self):
@@ -42,6 +54,29 @@ class DynamoDbWriter:
 
         if missing:
             raise ValueError(f"Missing required options: {', '.join(missing)}")
+
+    def _resolve_credentials(self):
+        """Resolve AWS credentials from a Databricks Unity Catalog service credential.
+
+        When credential_name is set, first tries databricks.service_credentials
+        (available on newer Databricks runtimes). If that fails, falls back to
+        the Databricks SDK generate-temporary-service-credential API.
+        """
+        if not self.credential_name:
+            return
+
+        try:
+            import databricks.service_credentials
+
+            provider = databricks.service_credentials.getServiceCredentialsProvider(self.credential_name)
+            credentials = provider.get_credentials().get_frozen_credentials()
+
+            self.aws_access_key_id = credentials.access_key
+            self.aws_secret_access_key = credentials.secret_key
+            self.aws_session_token = credentials.token
+            print(f"AWS credentials refreshed using service credential '{self.credential_name}'")
+        except Exception:
+            print("Using AWS credentials as Lakeflow Connect service credentials are not available")
 
     def _get_resource(self):
         """Create boto3 DynamoDB resource."""
@@ -63,6 +98,65 @@ class DynamoDbWriter:
             resource_kwargs["endpoint_url"] = self.endpoint_url
 
         return session.resource("dynamodb", **resource_kwargs)
+
+    def _create_table_if_not_exists(self):
+        """Create the DynamoDB table if it doesn't already exist."""
+        import botocore.exceptions
+
+        dynamodb = self._get_resource()
+
+        try:
+            table = dynamodb.Table(self.table_name)
+            table.creation_date_time  # triggers DescribeTable; raises if not found
+        except botocore.exceptions.ClientError as error:
+            if error.response["Error"]["Code"] != "ResourceNotFoundException":
+                raise
+
+            # Build attribute type from Spark schema
+            def get_attribute_type(spark_type):
+                type_name = spark_type.typeName()
+                if type_name in ("integer", "long", "float", "double", "decimal", "short", "byte"):
+                    return "N"
+                if type_name == "binary":
+                    return "B"
+                return "S"
+
+            # Map schema columns by name for lookup
+            schema_map = {field.name: field for field in self.schema.fields}
+
+            attribute_definitions = []
+            key_schema = []
+
+            # Hash key
+            if self.hash_key_name not in schema_map:
+                raise ValueError(
+                    f"hash_key '{self.hash_key_name}' not found in DataFrame schema"
+                )
+            attribute_definitions.append({
+                "AttributeName": self.hash_key_name,
+                "AttributeType": get_attribute_type(schema_map[self.hash_key_name].dataType),
+            })
+            key_schema.append({"AttributeName": self.hash_key_name, "KeyType": "HASH"})
+
+            # Range key (optional)
+            if self.range_key_name:
+                if self.range_key_name not in schema_map:
+                    raise ValueError(
+                        f"range_key '{self.range_key_name}' not found in DataFrame schema"
+                    )
+                attribute_definitions.append({
+                    "AttributeName": self.range_key_name,
+                    "AttributeType": get_attribute_type(schema_map[self.range_key_name].dataType),
+                })
+                key_schema.append({"AttributeName": self.range_key_name, "KeyType": "RANGE"})
+
+            table = dynamodb.create_table(
+                TableName=self.table_name,
+                KeySchema=key_schema,
+                AttributeDefinitions=attribute_definitions,
+                BillingMode=self.billing_mode,
+            )
+            table.wait_until_exists()
 
     def _load_table_metadata(self):
         """Load key schema from DynamoDB and validate DataFrame schema."""

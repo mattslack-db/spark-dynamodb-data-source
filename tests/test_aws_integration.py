@@ -560,6 +560,144 @@ def test_write_and_read_at_scale(spark, aws_table):
 
 
 # ---------------------------------------------------------------------------
+# Create table tests
+# ---------------------------------------------------------------------------
+
+
+def test_create_table_hash_key_only(spark):
+    """create_table option should auto-create a table with a hash key and write data."""
+    import boto3
+
+    auto_table_name = f"{TABLE_NAME}_autocreate"
+    dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
+
+    # Ensure table doesn't exist before the test
+    try:
+        t = dynamodb.Table(auto_table_name)
+        t.delete()
+        t.wait_until_not_exists()
+    except Exception:
+        pass
+
+    try:
+        data = [("ac-001", "Alice", 30), ("ac-002", "Bob", 25)]
+        df = spark.createDataFrame(data, ["id", "name", "age"])
+
+        opts = _spark_options(auto_table_name)
+        writer = df.write.format("dynamodb").mode("append")
+        for k, v in opts.items():
+            writer = writer.option(k, v)
+        writer.option("create_table", "true") \
+              .option("hash_key", "id") \
+              .save()
+
+        time.sleep(2)
+
+        # Verify table was created and data was written
+        table = dynamodb.Table(auto_table_name)
+        scan = table.scan()
+        items = scan.get("Items", [])
+        assert len(items) == 2
+        names = sorted(i["name"] for i in items)
+        assert names == ["Alice", "Bob"]
+
+        # Verify key schema
+        table.load()
+        assert len(table.key_schema) == 1
+        assert table.key_schema[0]["AttributeName"] == "id"
+        assert table.key_schema[0]["KeyType"] == "HASH"
+    finally:
+        try:
+            dynamodb.Table(auto_table_name).delete()
+        except Exception:
+            pass
+
+
+def test_create_table_composite_key(spark):
+    """create_table with hash_key + range_key should create a composite key table."""
+    import boto3
+
+    auto_table_name = f"{TABLE_NAME}_autocreate_comp"
+    dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
+
+    # Ensure table doesn't exist
+    try:
+        t = dynamodb.Table(auto_table_name)
+        t.delete()
+        t.wait_until_not_exists()
+    except Exception:
+        pass
+
+    try:
+        data = [("u1", "2025-01", "event_a"), ("u1", "2025-02", "event_b")]
+        df = spark.createDataFrame(data, ["pk", "sk", "payload"])
+
+        opts = _spark_options(auto_table_name)
+        writer = df.write.format("dynamodb").mode("append")
+        for k, v in opts.items():
+            writer = writer.option(k, v)
+        writer.option("create_table", "true") \
+              .option("hash_key", "pk") \
+              .option("range_key", "sk") \
+              .save()
+
+        time.sleep(2)
+
+        table = dynamodb.Table(auto_table_name)
+        scan = table.scan()
+        assert len(scan.get("Items", [])) == 2
+
+        # Verify composite key schema
+        table.load()
+        assert len(table.key_schema) == 2
+        key_map = {k["KeyType"]: k["AttributeName"] for k in table.key_schema}
+        assert key_map["HASH"] == "pk"
+        assert key_map["RANGE"] == "sk"
+    finally:
+        try:
+            dynamodb.Table(auto_table_name).delete()
+        except Exception:
+            pass
+
+
+def test_create_table_skips_if_exists(spark, aws_table):
+    """create_table should be a no-op when the table already exists."""
+    _clear_table(aws_table)
+
+    data = [("skip-001", "Alice", 30, 100)]
+    df = spark.createDataFrame(data, ["id", "name", "age", "score"])
+
+    opts = _spark_options(TABLE_NAME)
+    writer = df.write.format("dynamodb").mode("append")
+    for k, v in opts.items():
+        writer = writer.option(k, v)
+    writer.option("create_table", "true") \
+          .option("hash_key", "id") \
+          .save()
+
+    time.sleep(2)
+
+    resp = aws_table.get_item(Key={"id": "skip-001"})
+    assert resp["Item"]["name"] == "Alice"
+
+
+def test_write_without_create_table_fails_on_missing_table(spark):
+    """Writing to a non-existent table without create_table should fail."""
+    nonexistent = f"{TABLE_NAME}_does_not_exist"
+
+    data = [("x-001", "Alice")]
+    df = spark.createDataFrame(data, ["id", "name"])
+
+    opts = _spark_options(nonexistent)
+    writer = df.write.format("dynamodb").mode("append")
+    for k, v in opts.items():
+        writer = writer.option(k, v)
+
+    with pytest.raises(Exception):
+        writer.save()
+
+
+# ---------------------------------------------------------------------------
 # Streaming write test
 # ---------------------------------------------------------------------------
 

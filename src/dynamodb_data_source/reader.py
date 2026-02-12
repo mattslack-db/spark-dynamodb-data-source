@@ -38,6 +38,7 @@ class DynamoDbReader:
         self.aws_secret_access_key = options.get("aws_secret_access_key")
         self.aws_session_token = options.get("aws_session_token")
         self.endpoint_url = options.get("endpoint_url")
+        self.credential_name = options.get("credential_name")
 
         # Read options
         self.total_segments = int(options.get("total_segments", 1))
@@ -47,6 +48,9 @@ class DynamoDbReader:
         self.schema = schema
         self.columns = [field.name for field in schema.fields] if schema else []
 
+        # Resolve credentials on init (runs on driver, not fork-sensitive)
+        self._resolve_credentials()
+
     def _validate_options(self):
         """Validate required options are present."""
         required = ["table_name", "aws_region"]
@@ -54,6 +58,27 @@ class DynamoDbReader:
 
         if missing:
             raise ValueError(f"Missing required options: {', '.join(missing)}")
+
+    def _resolve_credentials(self):
+        """Resolve AWS credentials from a Databricks Unity Catalog service credential.
+
+        When credential_name is set, tries databricks.service_credentials
+        (available on newer Databricks runtimes). If that fails, assumes AWS
+        credentials are already set via options.
+        """
+        if not self.credential_name:
+            return
+
+        try:
+            import databricks.service_credentials
+            provider = databricks.service_credentials.getServiceCredentialsProvider(self.credential_name)
+            credentials = provider.get_credentials().get_frozen_credentials()
+            self.aws_access_key_id = credentials.access_key
+            self.aws_secret_access_key = credentials.secret_key
+            self.aws_session_token = credentials.token
+            print(f"AWS credentials refreshed using service credential '{self.credential_name}'")
+        except Exception:
+            print("Using AWS credentials as Lakeflow Connect service credentials are not available")
 
     def _get_resource(self):
         """Create boto3 DynamoDB resource."""

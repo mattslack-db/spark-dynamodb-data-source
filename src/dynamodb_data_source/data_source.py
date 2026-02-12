@@ -32,14 +32,31 @@ class DynamoDbDataSource(DataSource):
 
         table_name = self.options["table_name"]
         aws_region = self.options["aws_region"]
+        credential_name = self.options.get("credential_name")
+
+        # Resolve credentials from service credential if set
+        aws_access_key_id = self.options.get("aws_access_key_id")
+        aws_secret_access_key = self.options.get("aws_secret_access_key")
+        aws_session_token = self.options.get("aws_session_token")
+
+        if credential_name:
+            try:
+                import databricks.service_credentials
+                provider = databricks.service_credentials.getServiceCredentialsProvider(credential_name)
+                credentials = provider.get_credentials().get_frozen_credentials()
+                aws_access_key_id = credentials.access_key
+                aws_secret_access_key = credentials.secret_key
+                aws_session_token = credentials.token
+            except Exception:
+                print("Using AWS credentials as Lakeflow Connect service credentials are not available")
 
         session_kwargs = {"region_name": aws_region}
-        if self.options.get("aws_access_key_id"):
-            session_kwargs["aws_access_key_id"] = self.options["aws_access_key_id"]
-        if self.options.get("aws_secret_access_key"):
-            session_kwargs["aws_secret_access_key"] = self.options["aws_secret_access_key"]
-        if self.options.get("aws_session_token"):
-            session_kwargs["aws_session_token"] = self.options["aws_session_token"]
+        if aws_access_key_id:
+            session_kwargs["aws_access_key_id"] = aws_access_key_id
+        if aws_secret_access_key:
+            session_kwargs["aws_secret_access_key"] = aws_secret_access_key
+        if aws_session_token:
+            session_kwargs["aws_session_token"] = aws_session_token
 
         session = boto3.Session(**session_kwargs)
 
