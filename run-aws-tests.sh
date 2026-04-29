@@ -1,0 +1,1 @@
+poetry run pytest tests/test_aws_integration.py -v -m integration
