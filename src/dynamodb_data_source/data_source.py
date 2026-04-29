@@ -17,6 +17,7 @@ class DynamoDbDataSource(DataSource):
     def __init__(self, options):
         """Initialize data source with options."""
         self.options = options
+        self._stream_writer = None
 
     def schema(self):
         """
@@ -32,31 +33,33 @@ class DynamoDbDataSource(DataSource):
 
         table_name = self.options["table_name"]
         aws_region = self.options["aws_region"]
-        credential_name = self.options.get("credential_name")
-
-        # Resolve credentials from service credential if set
         aws_access_key_id = self.options.get("aws_access_key_id")
         aws_secret_access_key = self.options.get("aws_secret_access_key")
         aws_session_token = self.options.get("aws_session_token")
-
-        if credential_name:
-            try:
-                import databricks.service_credentials
-                provider = databricks.service_credentials.getServiceCredentialsProvider(credential_name)
-                credentials = provider.get_credentials().get_frozen_credentials()
-                aws_access_key_id = credentials.access_key
-                aws_secret_access_key = credentials.secret_key
-                aws_session_token = credentials.token
-            except Exception:
-                print("Using AWS credentials as Lakeflow Connect service credentials are not available")
+        credential_name = self.options.get("credential_name")
 
         session_kwargs = {"region_name": aws_region}
-        if aws_access_key_id:
-            session_kwargs["aws_access_key_id"] = aws_access_key_id
-        if aws_secret_access_key:
-            session_kwargs["aws_secret_access_key"] = aws_secret_access_key
-        if aws_session_token:
-            session_kwargs["aws_session_token"] = aws_session_token
+        if credential_name:
+            from .credentials import _driver_dbutils
+            try:
+                session_kwargs["botocore_session"] = (
+                    _driver_dbutils().credentials.getServiceCredentialsProvider(credential_name)
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    "Cannot derive schema from DynamoDB on the driver when "
+                    "`credential_name` is set: the driver-side `dbutils` is not "
+                    "reachable from the Spark Python data source callback "
+                    "process. Pass an explicit schema via `.schema(...)` on the "
+                    "reader to avoid driver-side schema inference."
+                ) from e
+        else:
+            if aws_access_key_id:
+                session_kwargs["aws_access_key_id"] = aws_access_key_id
+            if aws_secret_access_key:
+                session_kwargs["aws_secret_access_key"] = aws_secret_access_key
+            if aws_session_token:
+                session_kwargs["aws_session_token"] = aws_session_token
 
         session = boto3.Session(**session_kwargs)
 
@@ -89,8 +92,14 @@ class DynamoDbDataSource(DataSource):
 
     def writer(self, schema, overwrite):
         """Return a batch writer instance."""
-        return DynamoDbBatchWriter(self.options, schema)
+        writer = DynamoDbBatchWriter(self.options, schema)
+        writer.initialize()
+        return writer
 
     def streamWriter(self, schema, overwrite):
-        """Return a streaming writer instance."""
-        return DynamoDbStreamWriter(self.options, schema)
+        """Return a streaming writer instance, creating and initializing on first call."""
+        if self._stream_writer is None:
+            print("Initializing streaming writer")
+            self._stream_writer = DynamoDbStreamWriter(self.options, schema)
+            self._stream_writer.initialize()
+        return self._stream_writer

@@ -2,6 +2,8 @@
 
 from pyspark.sql.datasource import DataSourceWriter, DataSourceStreamWriter
 
+from .credentials import _driver_dbutils
+
 
 class DynamoDbWriter:
     """Base writer class with shared write logic for DynamoDB."""
@@ -41,11 +43,32 @@ class DynamoDbWriter:
         if self.create_table and not self.hash_key_name:
             raise ValueError("hash_key option is required when create_table is true")
 
-        # Resolve credentials, create table if needed, and load table metadata
-        self._resolve_credentials()
+    def initialize(self):
+        """Driver-side init: create the table and load metadata when we can
+        reach AWS from the driver.
+
+        When `credential_name` is set the data source callback runs in a
+        Python child process spawned by Spark, where notebook `dbutils` is not
+        available, so we defer AWS calls to the first `write()` invocation
+        on an executor (where the executor-side service credentials API is
+        usable).
+        """
+        if self.credential_name:
+            self._initialized = False
+            return
         if self.create_table:
             self._create_table_if_not_exists()
         self._load_table_metadata()
+        self._initialized = True
+
+    def _ensure_initialized(self):
+        """Lazy executor-side init for the `credential_name` path."""
+        if getattr(self, "_initialized", False):
+            return
+        if self.create_table:
+            self._create_table_if_not_exists()
+        self._load_table_metadata()
+        self._initialized = True
 
     def _validate_options(self):
         """Validate required options are present."""
@@ -55,28 +78,27 @@ class DynamoDbWriter:
         if missing:
             raise ValueError(f"Missing required options: {', '.join(missing)}")
 
-    def _resolve_credentials(self):
-        """Resolve AWS credentials from a Databricks Unity Catalog service credential.
+    def _get_botocore_session(self):
+        """Return an auto-refreshing botocore Session for the UC service credential.
 
-        When credential_name is set, first tries databricks.service_credentials
-        (available on newer Databricks runtimes). If that fails, falls back to
-        the Databricks SDK generate-temporary-service-credential API.
+        Picks the right API based on where this code is running:
+        - Executor (inside a TaskContext / Python UDF): use
+          `databricks.service_credentials.getServiceCredentialsProvider`.
+        - Driver (notebook / Spark application): use
+          `dbutils.credentials.getServiceCredentialsProvider`.
+
+        Returns None when no credential_name was provided.
         """
         if not self.credential_name:
-            return
+            return None
 
-        try:
-            import databricks.service_credentials
+        from pyspark import TaskContext
 
-            provider = databricks.service_credentials.getServiceCredentialsProvider(self.credential_name)
-            credentials = provider.get_credentials().get_frozen_credentials()
+        if TaskContext.get() is not None:
+            from databricks.service_credentials import getServiceCredentialsProvider
+            return getServiceCredentialsProvider(self.credential_name)
 
-            self.aws_access_key_id = credentials.access_key
-            self.aws_secret_access_key = credentials.secret_key
-            self.aws_session_token = credentials.token
-            print(f"AWS credentials refreshed using service credential '{self.credential_name}'")
-        except Exception:
-            print("Using AWS credentials as Lakeflow Connect service credentials are not available")
+        return _driver_dbutils().credentials.getServiceCredentialsProvider(self.credential_name)
 
     def _get_resource(self):
         """Create boto3 DynamoDB resource."""
@@ -84,12 +106,16 @@ class DynamoDbWriter:
 
         session_kwargs = {"region_name": self.aws_region}
 
-        if self.aws_access_key_id:
-            session_kwargs["aws_access_key_id"] = self.aws_access_key_id
-        if self.aws_secret_access_key:
-            session_kwargs["aws_secret_access_key"] = self.aws_secret_access_key
-        if self.aws_session_token:
-            session_kwargs["aws_session_token"] = self.aws_session_token
+        botocore_session = self._get_botocore_session()
+        if botocore_session is not None:
+            session_kwargs["botocore_session"] = botocore_session
+        else:
+            if self.aws_access_key_id:
+                session_kwargs["aws_access_key_id"] = self.aws_access_key_id
+            if self.aws_secret_access_key:
+                session_kwargs["aws_secret_access_key"] = self.aws_secret_access_key
+            if self.aws_session_token:
+                session_kwargs["aws_session_token"] = self.aws_session_token
 
         session = boto3.Session(**session_kwargs)
 
@@ -212,6 +238,8 @@ class DynamoDbWriter:
         This runs on executors, so import boto3 here.
         """
         from pyspark.sql.datasource import WriterCommitMessage
+
+        self._ensure_initialized()
 
         dynamodb = self._get_resource()
         table = dynamodb.Table(self.table_name)
