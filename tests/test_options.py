@@ -10,21 +10,20 @@ from pyspark.sql.types import StructType, StructField, StringType
 
 @pytest.fixture(autouse=False)
 def mock_databricks_sdk():
-    """Mock the Databricks SDK for credential resolution tests.
+    """Inject a mock `databricks.service_credentials` module.
 
-    The databricks packages are not installed locally. The writer code tries
-    databricks.service_credentials.getServiceCredentialsProvider and if it fails,
-    assumes AWS credentials are already set. The reader falls back to a REST API call.
-
-    This fixture injects a mock databricks.service_credentials module so that the
-    writer's try block succeeds. Yields a dict with 'service_credentials' mock.
+    The real package only exists on Databricks runtimes. The data source uses
+    `databricks.service_credentials.getServiceCredentialsProvider(name)` from
+    inside executor code (when a `TaskContext` is active) to obtain an
+    auto-refreshing botocore Session.
     """
     mock_service_credentials = MagicMock()
 
-    # Build the module hierarchy: databricks -> service_credentials
     databricks_mod = types.ModuleType("databricks")
     service_creds_mod = types.ModuleType("databricks.service_credentials")
-    service_creds_mod.getServiceCredentialsProvider = mock_service_credentials.getServiceCredentialsProvider
+    service_creds_mod.getServiceCredentialsProvider = (
+        mock_service_credentials.getServiceCredentialsProvider
+    )
     databricks_mod.service_credentials = service_creds_mod
 
     with patch.dict(sys.modules, {
@@ -354,11 +353,13 @@ def test_data_source_schema_method(mock_dynamodb_table):
         assert "name" in field_names
 
 
-def test_writer_with_credential_name(mock_databricks_sdk):
-    """Test writer resolves credentials via databricks.service_credentials when credential_name is set."""
-    from dynamodb_data_source import DynamoDbDataSource
+def test_writer_init_skips_aws_when_credential_name_set():
+    """When `credential_name` is set, driver-side initialize() must not touch AWS.
 
-    mock_svc = mock_databricks_sdk["service_credentials"]
+    Driver-side `dbutils` is unreachable from the Spark Python data source
+    callback process, so AWS calls are deferred to the first executor write.
+    """
+    from dynamodb_data_source import DynamoDbDataSource
 
     schema = StructType([StructField("id", StringType())])
     options = {
@@ -367,46 +368,87 @@ def test_writer_with_credential_name(mock_databricks_sdk):
         "credential_name": "my-dynamo-credential",
     }
 
-    # Set up the mock service_credentials provider chain
-    mock_frozen = MagicMock()
-    mock_frozen.access_key = "RESOLVED_KEY"
-    mock_frozen.secret_key = "RESOLVED_SECRET"
-    mock_frozen.token = "RESOLVED_TOKEN"
-    mock_provider = MagicMock()
-    mock_provider.get_credentials.return_value.get_frozen_credentials.return_value = mock_frozen
-    mock_svc.getServiceCredentialsProvider.return_value = mock_provider
-
-    # Mock boto3.Session
     mock_session_class = MagicMock()
-    mock_session = MagicMock()
-    mock_session_class.return_value = mock_session
-    mock_dynamodb = MagicMock()
-    mock_session.resource.return_value = mock_dynamodb
-    mock_table = MagicMock()
-    mock_table.key_schema = [{"AttributeName": "id", "KeyType": "HASH"}]
-    mock_table.load = MagicMock()
-    mock_dynamodb.Table.return_value = mock_table
 
     ds = DynamoDbDataSource(options)
-
     with patch("boto3.Session", mock_session_class):
         writer = ds.writer(schema, None)
-        assert writer.credential_name == "my-dynamo-credential"
-        assert writer.aws_access_key_id == "RESOLVED_KEY"
-        assert writer.aws_secret_access_key == "RESOLVED_SECRET"
-        assert writer.aws_session_token == "RESOLVED_TOKEN"
 
-        mock_svc.getServiceCredentialsProvider.assert_called_with(
-            "my-dynamo-credential"
-        )
+    assert writer.credential_name == "my-dynamo-credential"
+    assert writer._initialized is False
+    mock_session_class.assert_not_called()
 
 
-def test_reader_with_credential_name(mock_databricks_sdk):
-    """Test reader resolves credentials via databricks.service_credentials when credential_name is set."""
+def test_writer_uses_executor_credentials_provider(mock_databricks_sdk):
+    """Inside a TaskContext, write() must resolve via databricks.service_credentials.
+
+    The botocore Session returned by `getServiceCredentialsProvider(name)` is
+    passed as `boto3.Session(botocore_session=...)` so boto3 handles refresh.
+    """
+    from dynamodb_data_source.writer import DynamoDbBatchWriter
+
+    mock_svc = mock_databricks_sdk["service_credentials"]
+    sentinel_session = MagicMock(name="botocore_session")
+    mock_svc.getServiceCredentialsProvider.return_value = sentinel_session
+
+    schema = StructType([StructField("id", StringType())])
+    options = {
+        "table_name": "test_table",
+        "aws_region": "us-east-1",
+        "credential_name": "my-dynamo-credential",
+    }
+    writer = DynamoDbBatchWriter(options, schema)
+    # Skip _load_table_metadata for this unit test
+    writer._initialized = True
+    writer.key_schema = [{"AttributeName": "id", "KeyType": "HASH"}]
+    writer.hash_key = "id"
+    writer.range_key = None
+
+    mock_session_class = MagicMock()
+    mock_boto_session = MagicMock()
+    mock_session_class.return_value = mock_boto_session
+    mock_dynamodb = MagicMock()
+    mock_boto_session.resource.return_value = mock_dynamodb
+    mock_table = MagicMock()
+    mock_dynamodb.Table.return_value = mock_table
+    mock_table.batch_writer.return_value.__enter__.return_value = MagicMock()
+
+    fake_task_ctx = MagicMock()
+    with patch("boto3.Session", mock_session_class), \
+         patch("pyspark.TaskContext.get", return_value=fake_task_ctx):
+        writer.write(iter([]))
+
+    mock_svc.getServiceCredentialsProvider.assert_called_with("my-dynamo-credential")
+    mock_session_class.assert_called_with(
+        region_name="us-east-1",
+        botocore_session=sentinel_session,
+    )
+
+
+def test_reader_init_skips_aws_when_credential_name_set():
+    """Reader __init__ with credential_name must not touch AWS or dbutils."""
+    from dynamodb_data_source.reader import DynamoDbReader
+
+    schema = StructType([StructField("id", StringType())])
+    options = {
+        "table_name": "test_table",
+        "aws_region": "us-east-1",
+        "credential_name": "my-dynamo-credential",
+    }
+    reader = DynamoDbReader(options, schema)
+
+    assert reader.credential_name == "my-dynamo-credential"
+    assert reader.aws_access_key_id is None
+
+
+def test_reader_uses_executor_credentials_provider(mock_databricks_sdk):
+    """Inside a TaskContext, read() must resolve via databricks.service_credentials."""
     from dynamodb_data_source.reader import DynamoDbReader
     from dynamodb_data_source.partitioning import SegmentPartition
 
     mock_svc = mock_databricks_sdk["service_credentials"]
+    sentinel_session = MagicMock(name="botocore_session")
+    mock_svc.getServiceCredentialsProvider.return_value = sentinel_session
 
     schema = StructType([StructField("id", StringType())])
     options = {
@@ -414,91 +456,42 @@ def test_reader_with_credential_name(mock_databricks_sdk):
         "aws_region": "us-east-1",
         "credential_name": "my-dynamo-credential",
     }
-
-    # Set up the mock service_credentials provider chain
-    mock_frozen = MagicMock()
-    mock_frozen.access_key = "RESOLVED_KEY"
-    mock_frozen.secret_key = "RESOLVED_SECRET"
-    mock_frozen.token = "RESOLVED_TOKEN"
-    mock_provider = MagicMock()
-    mock_provider.get_credentials.return_value.get_frozen_credentials.return_value = mock_frozen
-    mock_svc.getServiceCredentialsProvider.return_value = mock_provider
-
     reader = DynamoDbReader(options, schema)
-    assert reader.credential_name == "my-dynamo-credential"
-    assert reader.aws_access_key_id == "RESOLVED_KEY"
-    assert reader.aws_secret_access_key == "RESOLVED_SECRET"
-    assert reader.aws_session_token == "RESOLVED_TOKEN"
 
-    mock_svc.getServiceCredentialsProvider.assert_called_with("my-dynamo-credential")
-
-    # Mock boto3.Session
     mock_session_class = MagicMock()
-    mock_session = MagicMock()
-    mock_session_class.return_value = mock_session
+    mock_boto_session = MagicMock()
+    mock_session_class.return_value = mock_boto_session
     mock_dynamodb = MagicMock()
-    mock_session.resource.return_value = mock_dynamodb
+    mock_boto_session.resource.return_value = mock_dynamodb
     mock_table = MagicMock()
     mock_table.scan.return_value = {"Items": [{"id": "abc-123"}]}
     mock_dynamodb.Table.return_value = mock_table
 
-    partition = SegmentPartition(0, 1)
+    fake_task_ctx = MagicMock()
+    with patch("boto3.Session", mock_session_class), \
+         patch("pyspark.TaskContext.get", return_value=fake_task_ctx):
+        list(reader.read(SegmentPartition(0, 1)))
 
-    with patch("boto3.Session", mock_session_class):
-        list(reader.read(partition))
-
-        mock_session_class.assert_called_with(
-            region_name="us-east-1",
-            aws_access_key_id="RESOLVED_KEY",
-            aws_secret_access_key="RESOLVED_SECRET",
-            aws_session_token="RESOLVED_TOKEN",
-        )
+    mock_svc.getServiceCredentialsProvider.assert_called_with("my-dynamo-credential")
+    mock_session_class.assert_called_with(
+        region_name="us-east-1",
+        botocore_session=sentinel_session,
+    )
 
 
-def test_schema_with_credential_name(mock_dynamodb_table, mock_databricks_sdk):
-    """Test schema() resolves credentials via databricks.service_credentials when credential_name is set."""
+def test_schema_with_credential_name_raises_when_dbutils_missing():
+    """schema() with credential_name and no driver-side dbutils should raise a clear error."""
     from dynamodb_data_source import DynamoDbDataSource
-    from pyspark.sql.types import StructType
-
-    mock_svc = mock_databricks_sdk["service_credentials"]
 
     options = {
         "table_name": "test_table",
         "aws_region": "us-east-1",
         "credential_name": "my-dynamo-credential",
     }
-
-    # Set up the mock service_credentials provider chain
-    mock_frozen = MagicMock()
-    mock_frozen.access_key = "RESOLVED_KEY"
-    mock_frozen.secret_key = "RESOLVED_SECRET"
-    mock_frozen.token = "RESOLVED_TOKEN"
-    mock_provider = MagicMock()
-    mock_provider.get_credentials.return_value.get_frozen_credentials.return_value = mock_frozen
-    mock_svc.getServiceCredentialsProvider.return_value = mock_provider
-
-    mock_session_class = MagicMock()
-    mock_session = MagicMock()
-    mock_session_class.return_value = mock_session
-    mock_dynamodb = MagicMock()
-    mock_session.resource.return_value = mock_dynamodb
-    mock_dynamodb.Table.return_value = mock_dynamodb_table
-
     ds = DynamoDbDataSource(options)
 
-    with patch("boto3.Session", mock_session_class):
-        schema = ds.schema()
-
-        assert isinstance(schema, StructType)
-        mock_session_class.assert_called_with(
-            region_name="us-east-1",
-            aws_access_key_id="RESOLVED_KEY",
-            aws_secret_access_key="RESOLVED_SECRET",
-            aws_session_token="RESOLVED_TOKEN",
-        )
-        mock_svc.getServiceCredentialsProvider.assert_called_with(
-            "my-dynamo-credential"
-        )
+    with pytest.raises(RuntimeError, match=r"explicit schema"):
+        ds.schema()
 
 
 def test_data_source_name():

@@ -2,6 +2,7 @@
 
 from pyspark.sql.datasource import DataSourceReader
 
+from .credentials import _driver_dbutils
 from .partitioning import SegmentPartition
 from .type_conversion import convert_dynamodb_value
 
@@ -48,9 +49,6 @@ class DynamoDbReader:
         self.schema = schema
         self.columns = [field.name for field in schema.fields] if schema else []
 
-        # Resolve credentials on init (runs on driver, not fork-sensitive)
-        self._resolve_credentials()
-
     def _validate_options(self):
         """Validate required options are present."""
         required = ["table_name", "aws_region"]
@@ -59,26 +57,27 @@ class DynamoDbReader:
         if missing:
             raise ValueError(f"Missing required options: {', '.join(missing)}")
 
-    def _resolve_credentials(self):
-        """Resolve AWS credentials from a Databricks Unity Catalog service credential.
+    def _get_botocore_session(self):
+        """Return an auto-refreshing botocore Session for the UC service credential.
 
-        When credential_name is set, tries databricks.service_credentials
-        (available on newer Databricks runtimes). If that fails, assumes AWS
-        credentials are already set via options.
+        Picks the right API based on where this code is running:
+        - Executor (inside a TaskContext / Python UDF): use
+          `databricks.service_credentials.getServiceCredentialsProvider`.
+        - Driver (notebook / Spark application): use
+          `dbutils.credentials.getServiceCredentialsProvider`.
+
+        Returns None when no credential_name was provided.
         """
         if not self.credential_name:
-            return
+            return None
 
-        try:
-            import databricks.service_credentials
-            provider = databricks.service_credentials.getServiceCredentialsProvider(self.credential_name)
-            credentials = provider.get_credentials().get_frozen_credentials()
-            self.aws_access_key_id = credentials.access_key
-            self.aws_secret_access_key = credentials.secret_key
-            self.aws_session_token = credentials.token
-            print(f"AWS credentials refreshed using service credential '{self.credential_name}'")
-        except Exception:
-            print("Using AWS credentials as Lakeflow Connect service credentials are not available")
+        from pyspark import TaskContext
+
+        if TaskContext.get() is not None:
+            from databricks.service_credentials import getServiceCredentialsProvider
+            return getServiceCredentialsProvider(self.credential_name)
+
+        return _driver_dbutils().credentials.getServiceCredentialsProvider(self.credential_name)
 
     def _get_resource(self):
         """Create boto3 DynamoDB resource."""
@@ -86,12 +85,16 @@ class DynamoDbReader:
 
         session_kwargs = {"region_name": self.aws_region}
 
-        if self.aws_access_key_id:
-            session_kwargs["aws_access_key_id"] = self.aws_access_key_id
-        if self.aws_secret_access_key:
-            session_kwargs["aws_secret_access_key"] = self.aws_secret_access_key
-        if self.aws_session_token:
-            session_kwargs["aws_session_token"] = self.aws_session_token
+        botocore_session = self._get_botocore_session()
+        if botocore_session is not None:
+            session_kwargs["botocore_session"] = botocore_session
+        else:
+            if self.aws_access_key_id:
+                session_kwargs["aws_access_key_id"] = self.aws_access_key_id
+            if self.aws_secret_access_key:
+                session_kwargs["aws_secret_access_key"] = self.aws_secret_access_key
+            if self.aws_session_token:
+                session_kwargs["aws_session_token"] = self.aws_session_token
 
         session = boto3.Session(**session_kwargs)
 
