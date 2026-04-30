@@ -29,10 +29,10 @@ The role must trust the UC master role with the metastore's external ID, **and
 trust itself** (UC validates that the role can self-assume).
 
 ```bash
-export AWS_PROFILE=databricks-sandbox-admin-<AWS_ACCOUNT_ID>
+export AWS_PROFILE=<your-aws-profile>
 export AWS_ACCOUNT_ID=<AWS_ACCOUNT_ID>
 export ROLE_NAME=spark-dynamodb-test-role
-export UC_MASTER_ROLE=arn:aws:iam::<UC_MASTER_ACCOUNT_ID>:role/unity-catalog-prod-UCMasterRole-14S5ZJVKOTYTL
+export UC_MASTER_ROLE=arn:aws:iam::<UC_MASTER_ACCOUNT_ID>:role/<UC_MASTER_ROLE_NAME>
 export UC_EXTERNAL_ID=<UC_EXTERNAL_ID>
 ```
 
