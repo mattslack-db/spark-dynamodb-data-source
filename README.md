@@ -138,6 +138,29 @@ df.write.format("dynamodb").mode("append").options(**uc_options).save()
 df = spark.read.format("dynamodb").options(**uc_options).load()
 ```
 
+#### Compute requirements and the explicit-schema caveat
+
+Validated end-to-end on classic DBR **17.3 LTS** (Spark 4.0) and serverless environment **v3** (`client.3.6`). Service credentials require DBR 16.2+ on classic, or serverless env v3+. On serverless, the wheel must be installed notebook-scoped (`%pip install` or the Environment side panel) — compute-scoped libraries are not supported there.
+
+**Pass an explicit `.schema(...)` whenever you use `credential_name`** — on both classic and serverless. The Python Data Source's `schema()` callback runs in a separate Python child process from the notebook, where `dbutils` is unreachable and `databricks.service_credentials.getServiceCredentialsProvider()` rejects the call (it requires a UDF context). Without an explicit schema you will get a `RuntimeError` telling you to add one. With one, schema inference is skipped and only the executor `read()`/`write()` callbacks run, which use the executor-side API correctly.
+
+```python
+from pyspark.sql.types import StructType, StructField, StringType, LongType
+
+schema = StructType([
+    StructField("id", StringType()),
+    StructField("name", StringType()),
+    StructField("age", LongType()),
+])
+
+df = (spark.read.format("dynamodb")
+      .schema(schema)
+      .options(**uc_options)
+      .load())
+```
+
+The write path needs no change — `df.write.format("dynamodb").options(**uc_options).save()` works as-is on both compute types, and credentials auto-refresh via the botocore `RefreshableCredentials` returned by the executor-side API.
+
 ## Configuration Options
 
 ### Connection Options

@@ -23,10 +23,17 @@ class DynamoDbDataSource(DataSource):
         """
         Return the schema of the data source.
 
-        Connects to DynamoDB on the driver to derive schema from table items.
-        This runs only once on the driver, never in forked worker processes.
+        Connects to DynamoDB to derive the schema from a sample of table items.
+
+        On classic DBR this runs on the notebook driver where `dbutils` is
+        reachable. On serverless / Spark Connect it runs in a separate Python
+        child process where `dbutils` is not reachable and
+        `databricks.service_credentials` rejects calls outside a UDF — so
+        schema inference cannot resolve a UC service credential there. Users
+        on serverless must pass an explicit `.schema(...)` to the reader.
         """
         from .schema import derive_schema_from_items
+        from .credentials import get_botocore_session
 
         import boto3
         from pyspark.sql.types import StructType, StructField, StringType, DoubleType, BinaryType
@@ -40,18 +47,17 @@ class DynamoDbDataSource(DataSource):
 
         session_kwargs = {"region_name": aws_region}
         if credential_name:
-            from .credentials import _driver_dbutils
             try:
-                session_kwargs["botocore_session"] = (
-                    _driver_dbutils().credentials.getServiceCredentialsProvider(credential_name)
-                )
+                session_kwargs["botocore_session"] = get_botocore_session(credential_name)
             except Exception as e:
                 raise RuntimeError(
                     "Cannot derive schema from DynamoDB on the driver when "
-                    "`credential_name` is set: the driver-side `dbutils` is not "
-                    "reachable from the Spark Python data source callback "
-                    "process. Pass an explicit schema via `.schema(...)` on the "
-                    "reader to avoid driver-side schema inference."
+                    "`credential_name` is set: neither `dbutils` nor the "
+                    "executor-side `databricks.service_credentials` API is "
+                    "usable from the Spark data source callback process "
+                    "(this happens on serverless / Spark Connect). Pass an "
+                    "explicit schema via `.schema(...)` on the reader to "
+                    "avoid driver-side schema inference."
                 ) from e
         else:
             if aws_access_key_id:

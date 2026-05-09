@@ -2,7 +2,7 @@
 
 from pyspark.sql.datasource import DataSourceReader
 
-from .credentials import _driver_dbutils
+from .credentials import get_botocore_session
 from .partitioning import SegmentPartition
 from .type_conversion import convert_dynamodb_value
 
@@ -57,35 +57,13 @@ class DynamoDbReader:
         if missing:
             raise ValueError(f"Missing required options: {', '.join(missing)}")
 
-    def _get_botocore_session(self):
-        """Return an auto-refreshing botocore Session for the UC service credential.
-
-        Picks the right API based on where this code is running:
-        - Executor (inside a TaskContext / Python UDF): use
-          `databricks.service_credentials.getServiceCredentialsProvider`.
-        - Driver (notebook / Spark application): use
-          `dbutils.credentials.getServiceCredentialsProvider`.
-
-        Returns None when no credential_name was provided.
-        """
-        if not self.credential_name:
-            return None
-
-        from pyspark import TaskContext
-
-        if TaskContext.get() is not None:
-            from databricks.service_credentials import getServiceCredentialsProvider
-            return getServiceCredentialsProvider(self.credential_name)
-
-        return _driver_dbutils().credentials.getServiceCredentialsProvider(self.credential_name)
-
     def _get_resource(self):
         """Create boto3 DynamoDB resource."""
         import boto3
 
         session_kwargs = {"region_name": self.aws_region}
 
-        botocore_session = self._get_botocore_session()
+        botocore_session = get_botocore_session(self.credential_name)
         if botocore_session is not None:
             session_kwargs["botocore_session"] = botocore_session
         else:

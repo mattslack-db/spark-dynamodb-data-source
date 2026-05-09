@@ -480,7 +480,14 @@ def test_reader_uses_executor_credentials_provider(mock_databricks_sdk):
 
 
 def test_schema_with_credential_name_raises_when_dbutils_missing():
-    """schema() with credential_name and no driver-side dbutils should raise a clear error."""
+    """schema() with `credential_name` and no driver-side `dbutils` should
+    raise a clear error.
+
+    Neither `dbutils` (not reachable in the data source callback) nor
+    `databricks.service_credentials` (refuses outside a UDF) is usable from
+    the schema callback on serverless / Spark Connect, so the only correct
+    response is to tell the user to pass an explicit schema.
+    """
     from dynamodb_data_source import DynamoDbDataSource
 
     options = {

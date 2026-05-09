@@ -5,3 +5,4 @@ dist/
 /pytest-coverage.txt
 /test-unit.xml
 .env
+.claude/
