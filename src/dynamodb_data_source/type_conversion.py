@@ -47,11 +47,17 @@ def convert_for_dynamodb(value):
     """
     Convert a Spark/Python value for writing to DynamoDB.
 
-    DynamoDB requires Decimal instead of float, and doesn't accept
-    empty strings for key attributes.
+    DynamoDB (via the boto3 resource API) requires ``Decimal`` instead of
+    ``float`` for numbers. ``float`` is converted to ``Decimal``; ``dict`` and
+    ``list`` are converted recursively; other scalars (str, int, bool, bytes)
+    pass through unchanged, with booleans preserved as booleans rather than
+    coerced to numbers. Recursion covers the container types Spark produces
+    from ``Row.asDict(recursive=True)`` (dicts and lists). ``set`` is *not*
+    recursed into — a set containing floats must be pre-converted by the caller
+    before writing.
 
     Args:
-        value: Value from a Spark Row
+        value: Value from a Spark Row (may be a scalar, dict, or list)
 
     Returns:
         Converted value suitable for DynamoDB put_item

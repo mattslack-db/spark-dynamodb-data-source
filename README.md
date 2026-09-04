@@ -9,6 +9,7 @@ Python Data Source for Apache Spark enabling batch and streaming reads/writes to
 - **Batch Reads**: Parallel scan with segment-based partitioning
 - **Schema Derivation**: Auto-infer schema from table items, or provide explicit schema for projection
 - **Delete Flag Support**: Conditional row deletion during writes
+- **Write Rate Limiting**: Optional per-partition throughput cap to avoid throttling
 - **Primary Key Validation**: Early validation ensures DataFrame contains all key columns
 - **Float/Decimal Handling**: Automatic float-to-Decimal conversion for writes
 - **Unity Catalog Service Credentials**: Authenticate via Databricks service credentials
@@ -63,6 +64,40 @@ df.write.format("dynamodb") \
     .option("delete_flag_value", "true") \
     .save()
 ```
+
+### Rate-Limited Writes
+
+Cap write throughput to avoid throttling a provisioned table (or to stay under a
+budget). `max_writes_per_second` paces items using a token bucket:
+
+```python
+df.write.format("dynamodb") \
+    .mode("append") \
+    .option("table_name", "users") \
+    .option("aws_region", "us-east-1") \
+    .option("max_writes_per_second", "500") \
+    .save()
+```
+
+**The limit is per Spark partition, not global.** Each partition runs its
+`write()` task independently on an executor with no cross-task coordination, so
+the effective cluster-wide rate is approximately
+`max_writes_per_second × number_of_partitions`. To target a global write rate,
+divide by your partition count (e.g. `df.rdd.getNumPartitions()`), or set the
+partition count explicitly with `repartition(n)` and size the option
+accordingly. One "write" is one item, which is **not** the same as one write
+capacity unit (WCU) for items larger than 1 KB.
+
+Two more caveats:
+
+- **Initial burst.** The token bucket starts full, so the first
+  `max_writes_per_second` items on each partition are written without pacing
+  before throttling engages. This burst is amortized over the write.
+- **Streaming.** For `writeStream`, the limit applies **per microbatch** (the
+  limiter resets each microbatch), not across the whole stream. Frequent small
+  microbatches can therefore exceed the nominal rate. For streaming, prefer
+  controlling throughput with `maxOffsetsPerTrigger` / trigger interval, or a
+  provisioned-capacity table.
 
 ### Batch Read
 
@@ -185,6 +220,7 @@ The write path needs no change — `df.write.format("dynamodb").options(**uc_opt
 | `hash_key` | No* | - | Hash key column name (required when `create_table` is `true`) |
 | `range_key` | No | - | Range key column name |
 | `billing_mode` | No | `PAY_PER_REQUEST` | Billing mode for table creation (`PAY_PER_REQUEST` or `PROVISIONED`) |
+| `max_writes_per_second` | No | - | Cap on write throughput, **per Spark partition** (items/sec). Unset means no limit. See [Rate-Limited Writes](#rate-limited-writes). |
 
 ### Read Options
 

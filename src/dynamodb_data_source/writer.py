@@ -3,6 +3,8 @@
 from pyspark.sql.datasource import DataSourceWriter, DataSourceStreamWriter
 
 from .credentials import get_botocore_session
+from .rate_limiter import TokenBucketRateLimiter
+from .type_conversion import convert_for_dynamodb
 
 
 class DynamoDbWriter:
@@ -32,6 +34,24 @@ class DynamoDbWriter:
         self.hash_key_name = options.get("hash_key")
         self.range_key_name = options.get("range_key")
         self.billing_mode = options.get("billing_mode", "PAY_PER_REQUEST")
+
+        # Optional per-partition write throughput limit (items/sec). Spark runs
+        # write() independently per partition, so the effective global rate is
+        # roughly max_writes_per_second * numPartitions.
+        raw_rate_limit = options.get("max_writes_per_second")
+        if raw_rate_limit is None:
+            self.max_writes_per_second = None
+        else:
+            try:
+                self.max_writes_per_second = float(raw_rate_limit)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"max_writes_per_second must be a number, got {raw_rate_limit!r}"
+                )
+            if self.max_writes_per_second <= 0:
+                raise ValueError(
+                    f"max_writes_per_second must be positive, got {self.max_writes_per_second}"
+                )
 
         # Validate delete flag options
         if bool(self.delete_flag_column) != bool(self.delete_flag_value):
@@ -197,18 +217,6 @@ class DynamoDbWriter:
                 f"Available columns: {', '.join(sorted(df_columns))}"
             )
 
-    def _convert_floats(self, obj):
-        """Convert float values to Decimal for DynamoDB compatibility."""
-        from decimal import Decimal
-
-        if isinstance(obj, float):
-            return Decimal(str(obj))
-        if isinstance(obj, dict):
-            return {k: self._convert_floats(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [self._convert_floats(item) for item in obj]
-        return obj
-
     def write(self, iterator):
         """
         Write data to DynamoDB using batch_writer.
@@ -222,10 +230,27 @@ class DynamoDbWriter:
         dynamodb = self._get_resource()
         table = dynamodb.Table(self.table_name)
 
+        limiter = (
+            TokenBucketRateLimiter(self.max_writes_per_second)
+            if self.max_writes_per_second
+            else None
+        )
+
         row_count = 0
 
-        with table.batch_writer() as batch:
+        # De-duplicate by the table's full primary key within each flushed
+        # batch. A single BatchWriteItem call cannot reference the same key
+        # twice ("Provided list of item keys contains duplicates"), which would
+        # otherwise fail the whole batch when a partition or streaming
+        # microbatch repeats a key (e.g. a CDC diff). boto3 keeps the last
+        # operation per key per flush, matching DynamoDB's batch semantics.
+        key_names = [k["AttributeName"] for k in self.key_schema]
+
+        with table.batch_writer(overwrite_by_pkeys=key_names) as batch:
             for row in iterator:
+                if limiter is not None:
+                    limiter.acquire(1)
+
                 row_dict = row.asDict(recursive=True)
 
                 # Check if this is a delete
@@ -236,10 +261,11 @@ class DynamoDbWriter:
                         is_delete = True
 
                 if is_delete:
-                    # Build key for delete
-                    key = {self.hash_key: row_dict[self.hash_key]}
+                    # Build key for delete, converting values (e.g. float -> Decimal)
+                    # so numeric keys work here just as they do on the PUT path.
+                    key = {self.hash_key: convert_for_dynamodb(row_dict[self.hash_key])}
                     if self.range_key:
-                        key[self.range_key] = row_dict[self.range_key]
+                        key[self.range_key] = convert_for_dynamodb(row_dict[self.range_key])
 
                     # Validate key values are not null
                     for k, v in key.items():
@@ -251,8 +277,8 @@ class DynamoDbWriter:
                     # Remove delete flag column from item data
                     item = {k: v for k, v in row_dict.items() if k != self.delete_flag_column}
 
-                    # Convert floats to Decimal (DynamoDB requires Decimal for numbers)
-                    item = self._convert_floats(item)
+                    # Convert values for DynamoDB (e.g. float -> Decimal).
+                    item = convert_for_dynamodb(item)
 
                     # Validate key columns are not null
                     for key_def in self.key_schema:
