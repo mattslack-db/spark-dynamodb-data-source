@@ -180,6 +180,42 @@ def test_batch_write_basic(spark, aws_table):
     assert names == ["Alice", "Bob", "Charlie"]
 
 
+def test_batch_write_with_rate_limit(spark, aws_table):
+    """max_writes_per_second paces writes and still lands every row.
+
+    Uses a single partition so the per-partition limit governs the whole write.
+    The timing check is a lower bound: pacing can only add delay, so it is
+    robust to network jitter. Burst = capacity = rate, so the first `rate`
+    items go immediately and the rest are paced.
+    """
+    _clear_table(aws_table)
+
+    rows = 25
+    rate = 10  # items/sec; capacity defaults to rate
+    expected_min_seconds = (rows - rate) / rate  # 1.5s of enforced pacing
+
+    data = [(f"rl-{i:03d}", f"User_{i}", i, i * 10) for i in range(rows)]
+    df = spark.createDataFrame(data, ["id", "name", "age", "score"]).repartition(1)
+
+    opts = _spark_options(TABLE_NAME)
+    writer = df.write.format("dynamodb").mode("append")
+    for k, v in opts.items():
+        writer = writer.option(k, v)
+
+    start = time.monotonic()
+    writer.option("max_writes_per_second", str(rate)).save()
+    elapsed = time.monotonic() - start
+
+    assert elapsed >= expected_min_seconds, (
+        f"write finished in {elapsed:.2f}s, expected >= {expected_min_seconds:.2f}s of pacing"
+    )
+
+    time.sleep(2)
+
+    scan = aws_table.scan()
+    assert len(scan.get("Items", [])) == rows
+
+
 def test_batch_write_overwrites_existing(spark, aws_table):
     """Writing the same key twice should overwrite the item."""
     _clear_table(aws_table)
