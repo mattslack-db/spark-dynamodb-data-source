@@ -18,7 +18,7 @@ boto3 = "^1.42.45"
 
 [tool.poetry.group.dev.dependencies]
 ruff = "^0.15.12"
-pyspark = {extras = ["sql,connect"], version = "4.1.1"}
+pyspark = {extras = ["sql,connect"], version = "4.2.0"}
 grpcio = ">=1.76.0"
 grpcio-status = ">=1.76.0"
 googleapis-common-protos = ">=1.71.0"
